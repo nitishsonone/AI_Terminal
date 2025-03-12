@@ -1,0 +1,215 @@
+stages:
+  - build
+  - test
+  - monitor
+
+variables:
+  IMAGE_NAME: "nitishsonone/cric"
+  TAG: "latest"
+  TRIVY_EXPORTER_URL: "http://trivy-exporter:9811/metrics"
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+  
+    - docker login -u "nitishsonone" -p "Nitish123@"
+  script:
+    - docker build -t $IMAGE_NAME:$TAG .
+    - docker save -o cl-ai.tar $IMAGE_NAME:$TAG 
+  artifacts:
+    paths:
+      - cl-ai.tar  
+    expire_in: 1 day
+
+ttest-trivvy:
+  stage: test
+  image: docker:latest
+  services:
+    - docker:dind
+
+  script:
+    - ls -l 
+    - |
+      if [ ! -f "cl-ai.tar" ]; then 
+        echo "Error: cl_ai.tar not found!";
+        exit 1;
+      fi
+    - docker load -i cl-ai.tar  
+    - apk add --no-cache curl jq
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+    - install -m 0755 ./bin/trivy /usr/local/bin/trivy  
+    - trivy --version 
+    - curl -sSfL -o trivy-html.tpl https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+    - trivy image --exit-code 0 --format template --template "@trivy-html.tpl" -o trivy-report.html $IMAGE_NAME:$TAG
+    - trivy image --format json -o trivy-report.json $IMAGE_NAME:$TAG
+
+  
+    - |
+      echo "# HELP trivy_vulnerabilities Number of vulnerabilities found" > trivy-metrics.txt
+      echo "# TYPE trivy_vulnerabilities gauge" >> trivy-metrics.txt
+      jq -r '.Results[].Vulnerabilities[] | select(.Severity=="HIGH" or .Severity=="CRITICAL") | "trivy_vulnerabilities{severity=\"\(.Severity)\"} 1"' trivy-report.json | \
+      awk '{count[$1]++} END {for (key in count) print key, count[key]}' >> trivy-metrics.txt
+
+  artifacts:
+    paths:
+      - trivy-report.html
+      - trivy-report.json
+      - trivy-metrics.txt
+    expire_in: 7 days
+
+monitor:
+  stage: monitor
+  image: docker:latest
+  services:
+    - name: docker:dind
+    - name: grafana/grafana
+      alias: grafana
+    - name: prom/prometheus
+      alias: prometheus
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    GRAFANA_HOST: "http://grafana:3000"
+    PROMETHEUS_HOST: "http://prometheus:9090"
+    GRAFANA_API_KEY: "glsa_pimNSOgbc1Xl0203tYwI7kJCGNIGBwYm_64e1492d"
+  dependencies:
+    - ttest-trivvy  #  Ensure Trivy scan results are accessible
+  script:
+    #  Step 1: Install dependencies
+    - apk add --no-cache curl jq python3 py3-pip net-tools
+
+    #  Step 2: Fetch Trivy Scan Results from Artifacts
+    - echo "Fetching Trivy scan results..."
+    - ls -l 
+    - |
+      if [ ! -f "trivy-report.json" ]; then
+        echo " Trivy results file not found!"
+        exit 1
+      else
+        echo "Trivy results file found!"
+      fi
+
+    #  Step 3: Convert Trivy Results to Prometheus Format
+    - echo "Processing Trivy scan results..."
+    - |
+      cat <<EOF > trivy_to_prometheus.py
+      import json
+      import os
+      def convert_trivy_to_prometheus(input_file="trivy-report.json", output_file="trivy-metrics.prom"):
+          if not os.path.exists(input_file):
+              print(f"Error: Input file '{input_file}' not found.")
+              exit(1)
+          with open(input_file, "r") as f:
+              data = json.load(f)
+          metrics = []
+          for vuln in data.get("Results", []):
+              for finding in vuln.get("Vulnerabilities", []):
+                  severity = finding["Severity"]
+                  name = finding["VulnerabilityID"]
+                  package = finding["PkgName"]
+                  version = finding["InstalledVersion"]
+                  metric = f'trivy_vulnerability{{vuln_id="{name}", package="{package}", version="{version}", severity="{severity}"}} 1'
+                  metrics.append(metric)
+          with open(output_file, "w") as f:
+              f.write("\n".join(metrics))
+      if __name__ == "__main__":
+          convert_trivy_to_prometheus()
+      EOF
+    - python3 trivy_to_prometheus.py || { echo "Failed to convert Trivy results to Prometheus format"; exit 1; }
+
+    #  Step 4: Start Trivy Metrics Server (Flask)
+    - echo "Starting Trivy metrics server..."
+    - |
+      cat <<EOF > trivy_server.py
+      from flask import Flask, Response
+      app = Flask(__name__)
+      @app.route('/metrics')
+      def metrics():
+          with open("trivy-metrics.prom", "r") as f:
+              data = f.read()
+          return Response(data, mimetype="text/plain")
+      if __name__ == "__main__":
+          app.run(host="0.0.0.0", port=9811)
+      EOF
+    - nohup python3 trivy_server.py &
+
+    #  Step 5: Start Prometheus & Ensure It’s Running
+    - echo "Starting Prometheus..."
+    - |
+      cat <<EOF > prometheus.yml
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: "trivy"
+          static_configs:
+            - targets: ["localhost:9811"]
+      EOF
+    - docker network create monitoring || echo "Monitoring network already exists"
+    - docker run -d --name=prometheus --network=monitoring -p 9090:9090 -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
+    - sleep 30
+    - echo "Checking if Prometheus is running..."
+    - curl -X GET "$PROMETHEUS_HOST/api/v1/targets" | jq || { echo "Prometheus not reachable"; exit 1; }
+
+    # Step 6: Start Grafana & Ensure It’s Running
+    - echo "Starting Grafana..."
+    - docker run -d --name=grafana --network=monitoring -p 3000:3000 grafana/grafana
+    - sleep 60
+    - echo "Checking if Grafana is running..."
+    - curl -X GET "$GRAFANA_HOST/api/health" || { echo "Grafana not responding"; exit 1; }
+
+    # Step 7: Import Grafana Dashboard
+    - echo "Importing Trivy Dashboard into Grafana..."
+    - |
+      cat <<EOF > grafana-dashboard.json
+      {
+        "dashboard": {
+          "title": "Trivy Security Dashboard",
+          "panels": [
+            {
+              "title": "High & Critical Vulnerabilities",
+              "type": "graph",
+              "targets": [
+                {"expr": "trivy_vulnerability{severity='HIGH'}", "legendFormat": "HIGH"},
+                {"expr": "trivy_vulnerability{severity='CRITICAL'}", "legendFormat": "CRITICAL"}
+              ]
+            }
+          ]
+        },
+        "overwrite": true
+      }
+      EOF
+    - |
+      curl -X POST "$GRAFANA_HOST/api/dashboards/db" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $GRAFANA_API_KEY" \
+      -d @grafana-dashboard.json || { echo "Failed to import Grafana dashboard"; exit 1; }
+
+    # Step 8: Install & Start Cloudflare Tunnel
+    - echo "Installing Cloudflare Tunnel..."
+    - curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+    - chmod +x /usr/local/bin/cloudflared
+
+    - echo "Starting Cloudflare Tunnel for Prometheus..."
+    - nohup cloudflared tunnel --url "$PROMETHEUS_HOST" > cloudflare-prometheus.log 2>&1 &
+    - sleep 10
+
+    - echo "Starting Cloudflare Tunnel for Grafana..."
+    - nohup cloudflared tunnel --url "$GRAFANA_HOST" > cloudflare-grafana.log 2>&1 &
+    - sleep 10
+
+    #  Print Cloudflare Public URLs
+    - cat cloudflare-grafana.log | grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' > grafana_url.txt || { echo "Failed to start Cloudflare Tunnel for Grafana"; exit 1; }
+    - cat cloudflare-prometheus.log | grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' > prometheus_url.txt || { echo " Failed to start Cloudflare Tunnel for Prometheus"; exit 1; }
+
+    - echo "Grafana is accessible at:" $(cat grafana_url.txt)
+    - echo "Prometheus is accessible at:" $(cat prometheus_url.txt)
+
+    # Verify Prometheus Metrics
+    - echo "Verifying Prometheus is receiving metrics..."
+    - curl -X GET "$PROMETHEUS_HOST/api/v1/query?query=trivy_vulnerability" | jq || { echo " Prometheus is not receiving metrics"; exit 1; }
+
+    #  Debug: List Running Containers
+    - docker ps -a
+    - sleep 3000
